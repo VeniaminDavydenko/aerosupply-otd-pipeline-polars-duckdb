@@ -1,0 +1,4 @@
+STUDY_GUIDE.docx
+__pycache__/
+*.pyc
+.venv/
