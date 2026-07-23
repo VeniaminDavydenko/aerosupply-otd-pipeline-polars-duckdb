@@ -1,7 +1,0 @@
-# The script imports only these two:
-polars>=1.0
-duckdb>=1.0
-
-# Engines the two libraries use under the hood (not imported by the script):
-xlsxwriter>=3.0   # Polars' backend for .write_excel()
-pyarrow>=15.0     # how DuckDB reads a Polars frame by name
