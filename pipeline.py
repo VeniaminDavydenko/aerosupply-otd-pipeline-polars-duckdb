@@ -1,18 +1,4 @@
-"""
-Supplier OTD pipeline — daily on-time-delivery report for buyers.
-
-Four stages: clean (Polars) -> metrics (DuckDB) -> validate -> output.
-Reads the raw PO lines + supplier lookup, writes timestamped Excel files and a
-Parquet extract into output/, and logs one line to pipeline_log.txt.
-
-Built on two tools only: Polars (clean + write) and DuckDB (SQL metrics).
-
-Run:  python pipeline.py
-
-Overdue logic is pinned to ASOF because the dataset is synthetic and frozen in
-the past; filenames and the log use the real run date. See STUDY_GUIDE.docx for
-the full walkthrough of every stage and why it's built this way.
-"""
+"""Daily supplier on-time-delivery report: clean, metrics, validate, output."""
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -20,15 +6,14 @@ from pathlib import Path
 import polars as pl
 import duckdb
 
-# Paths resolve off this file so the script runs from any directory.
 PIPE_DIR = Path(__file__).resolve().parent
-ROOT = PIPE_DIR.parent                          # repo root; data/ lives here
+ROOT = PIPE_DIR.parent
 DATA = ROOT / "data"
 OUT = PIPE_DIR / "output"
 LOG = PIPE_DIR / "pipeline_log.txt"
 
-ASOF = date(2026, 6, 1)     # pinned "today" for overdue logic
-MIN_ROWS = 500              # validation floor (real file is ~1,480 lines)
+ASOF = date(2026, 6, 1)     # dataset is frozen in the past, so pin "today"
+MIN_ROWS = 500
 RUN_DATE = date.today().isoformat()
 STAMP = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -38,26 +23,25 @@ def log(line: str) -> None:
         f.write(line + "\n")
 
 
-# ---- Stage 1 · Clean (Polars, lazy) ----------------------------------------
-lazy = pl.scan_csv(DATA / "purchase_order_lines.csv").with_columns(
-    pl.col("promised_date").str.to_date(strict=False),
-    pl.col("received_date").str.to_date(strict=False),   # empty -> null (open lines)
-).with_columns(
-    (pl.col("received_date") - pl.col("promised_date")).dt.total_days().alias("days_late"),
-).with_columns(
-    (pl.col("days_late") <= 0).alias("on_time"),
+# Clean
+clean_df = (
+    pl.scan_csv(DATA / "purchase_order_lines.csv")
+    .with_columns(
+        pl.col("promised_date").str.to_date(strict=False),
+        pl.col("received_date").str.to_date(strict=False),
+    )
+    .with_columns(
+        (pl.col("received_date") - pl.col("promised_date")).dt.total_days().alias("days_late"),
+    )
+    .with_columns(
+        (pl.col("days_late") <= 0).alias("on_time"),
+    )
+    .collect()
 )
-
-# Drop cancelled lines if the feed ever grows a status column (no-op today).
-if "status" in lazy.collect_schema().names():
-    lazy = lazy.filter(pl.col("status") != "Cancelled")
-
-clean_df = lazy.collect()
-suppliers_df = pl.read_csv(DATA / "suppliers.csv")       # small name lookup
+suppliers_df = pl.read_csv(DATA / "suppliers.csv")
 
 
-# ---- Stage 2 · Metrics (DuckDB reads the Polars frames by name) ------------
-# Received lines only; FILTER does the conditional count/avg inline.
+# Metrics
 scorecard_df = duckdb.sql("""
     SELECT
         s.supplier_name,
@@ -83,7 +67,6 @@ monthly_df = duckdb.sql("""
     ORDER BY 1
 """).pl()
 
-# Open lines already past promise as of ASOF, bucketed by days overdue.
 aging_df = duckdb.sql(f"""
     SELECT
         s.supplier_name,
@@ -104,7 +87,7 @@ aging_df = duckdb.sql(f"""
 """).pl()
 
 
-# ---- Stage 3 · Validate (fail fast, before writing anything) ---------------
+# Validate
 reason = None
 if clean_df.height < MIN_ROWS:
     reason = f"row count {clean_df.height} below floor {MIN_ROWS}"
@@ -121,12 +104,10 @@ else:
 if reason:
     log(f"{STAMP} | FAIL | {reason}")
     print(f"VALIDATION FAILED: {reason}")
-    sys.exit(1)     # non-zero so the scheduler flags the run
+    sys.exit(1)
 
 
-# ---- Stage 4 · Output + log ------------------------------------------------
-# Each metric is written to its own Excel file with a plain one-line Polars call,
-# plus the scorecard as Parquet for downstream tools.
+# Output
 OUT.mkdir(exist_ok=True)
 scorecard_df.write_excel(OUT / f"otd_scorecard_{RUN_DATE}.xlsx")
 monthly_df.write_excel(OUT / f"monthly_otd_trend_{RUN_DATE}.xlsx")
